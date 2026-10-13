@@ -316,11 +316,25 @@ def _build_fallback_llm(tier: str) -> LLM | None:
 
 def _build_tier_llm(tier: str, default_model: str) -> LLM:
     load_dotenv()
-    primary = LLM(
-        model=os.getenv(f"CREWAI_{tier}_MODEL", default_model),
-        temperature=float(os.getenv("CREWAI_TEMPERATURE", "0.2")),
-        **_llm_kwargs(tier),
-    )
+    model = os.getenv(f"CREWAI_{tier}_MODEL", default_model)
+    temperature = float(os.getenv("CREWAI_TEMPERATURE", "0.2"))
+    try:
+        primary = LLM(model=model, temperature=temperature, **_llm_kwargs(tier))
+    except Exception as exc:
+        # The call-time failover above cannot help when the primary cannot even
+        # be constructed (provider SDK dropped by a venv re-sync, bad prefix).
+        # Run the whole tier on the fallback rather than dying at startup
+        # (2026-09-04: `crewai[anthropic]` missing killed the Friday run).
+        fallback = _build_fallback_llm(tier)
+        if fallback is None:
+            raise
+        print(
+            f"[seo-agents] {tier} primary model {model} could not be built "
+            f"({type(exc).__name__}: {exc}); running tier on fallback "
+            f"{fallback.model}",
+            flush=True,
+        )
+        return fallback
     return _attach_failover(primary, _build_fallback_llm(tier), tier)
 
 
@@ -464,23 +478,27 @@ def build_grizzly_crew(
         description=(
             f"{shared_context}\n\n"
             "Review website SEO for the current focus using the baseline report AND live verification via ScrapeWebsiteTool.\n\n"
-            "STEP 1 — VERIFY COMPLETED TASKS FIRST (mandatory before any new research):\n"
-            "The shared context above includes a 'COMPLETED TASKS FROM PREVIOUS RUNS' section. For each completed task, "
-            "scrape the relevant live page and confirm the work is still in place. Report each as:\n"
-            "  ✅ CONFIRMED LIVE: [task title] — [what you saw on the page]\n"
+            "STEP 1 — READ THE 'WORK ALREADY DONE' BRIEF in the shared context above. Do not recommend "
+            "anything on that list again. Do NOT scrape pages just to re-verify it: that list is long and "
+            "you have a limited number of tool calls. While scraping pages for the current focus, if you "
+            "see a completed item missing or broken, report it as:\n"
             "  ❌ REGRESSION: [task title] — [what is missing or broken now]\n"
-            "Do this check for every completed task before writing any new recommendations.\n\n"
+            "Spot-check at most 3 completed items, and only on pages you are visiting anyway.\n\n"
             "STEP 2 — LIVE VERIFICATION RULE (mandatory for all issues):\n"
             "For every issue mentioned in the baseline, scrape the relevant live page and confirm the issue still exists "
             "before recommending it. If the page looks fine, the form works, or the issue is gone — mark it RESOLVED "
             "and do not recommend it. Only surface issues that are present right now.\n\n"
             "For conversion issues specifically (contact form, phone visibility, CTAs): scrape the contact page and the "
             "homepage. Report what you actually see, not what the baseline says to expect.\n\n"
-            "Do not claim access to Search Console, CMS backend, or rankings data unless proven by tool output."
+            "Do not claim access to Search Console, CMS backend, or rankings data unless proven by tool output.\n\n"
+            "OUTPUT RULE: your final answer is the report ONLY. Do not include working notes, scrape "
+            "narration, or 'Let me check...' commentary — the output budget is finite and twice on "
+            "2026-09-04 that commentary consumed it before the report began, failing the run. The very "
+            "first characters of your answer must be [START:WEBSITE] and the last must be [END:WEBSITE]."
         ),
         expected_output=(
-            "A Website SEO Report wrapped in [START:WEBSITE]...[END:WEBSITE] markers, containing: "
-            "homepage notes, service-page findings, technical issues, conversion issues, "
+            "A Website SEO Report wrapped in [START:WEBSITE]...[END:WEBSITE] markers and nothing outside "
+            "them, containing: homepage notes, service-page findings, technical issues, conversion issues, "
             "recommended actions, draft copy, and owner approval needs."
         ),
         agent=website_agent,
@@ -626,6 +644,20 @@ def _filter_executable_tasks() -> list[dict[str, Any]]:
     return tasks
 
 
+def task_graph_tasks() -> list[dict[str, Any]] | None:
+    """Every task in task_graph.json, or None when the file is absent or
+    unreadable (a legacy run that never built a task graph)."""
+    from seo_agents.evidence import TASK_GRAPH_PATH
+
+    if not TASK_GRAPH_PATH.exists():
+        return None
+    try:
+        data = json.loads(TASK_GRAPH_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return list(data.get("tasks", []))
+
+
 # ---------------------------------------------------------------------------
 # Executor Crew  (seo-agents execute)
 # ---------------------------------------------------------------------------
@@ -671,9 +703,15 @@ def build_executor_crew() -> Crew:
             for t in _task_graph_filter
         ]
         queue_text = "\n".join(lines)
-    else:
-        # No filtered tasks — legacy run without a task graph; use raw queue
+    elif task_graph_tasks() is None:
+        # Legacy run that never built a task graph: the raw queue is all we have.
         queue_text = execution_queue
+    else:
+        # A task graph exists and nothing in it is executable. main.py skips the
+        # crew in this case (executor_skip_reason); if it is built anyway, the
+        # agents must not see the blocked tasks. On 2026-09-04 the raw-queue
+        # fallback fed four owner-blocked tasks to six agents for 30 minutes.
+        queue_text = "(No executable tasks — every queued task is blocked or waiting on the owner.)"
 
     queue_context = (
         "You are reading the execution queue plus the live website structure reference. "
@@ -1020,6 +1058,21 @@ def build_poster_crew(
     content_report = read_output("content_report.md")
     gbp_report = read_output("gbp_report.md")
 
+    gbp_date_table = ""
+    if start_date:
+        try:
+            gbp_anchor = date.fromisoformat(start_date)
+            rows = []
+            for d in range(1, days + 1):
+                dt = gbp_anchor + timedelta(days=d - 1)
+                rows.append(
+                    f"  DAY {d} -> DATE: {dt.isoformat()} "
+                    f"({dt.strftime('%A')}, {dt.strftime('%B')} {dt.day}, {dt.year})"
+                )
+            gbp_date_table = "\n".join(rows)
+        except ValueError:
+            gbp_date_table = ""
+
     poster_context = (
         f"GBP_PHOTO_PATH: {photo_path}\n"
         f"MANIFEST: {manifest_path}\n"
@@ -1029,8 +1082,16 @@ def build_poster_crew(
         "MANIFEST RULE: Only select photos from the AVAILABLE PHOTOS list above. "
         "Photos already marked used/archived in the manifest are excluded and must not be reused.\n\n"
         f"START DATE: {start_date or 'Next business day'}\n"
-        f"DAYS TO SCHEDULE: {days}\n\n"
-        "CONTENT REPORT (research phase):\n\n"
+        f"DAYS TO SCHEDULE: {days}\n"
+    )
+    if gbp_date_table:
+        poster_context += (
+            "\nEXACT POSTING DATES — copy these verbatim into the DATE field. Do NOT "
+            "compute, shift, or re-label them, and do not use today's date:\n"
+            f"{gbp_date_table}\n"
+        )
+    poster_context += (
+        "\nCONTENT REPORT (research phase):\n\n"
         f"{content_report}\n\n"
         "GBP REPORT (research phase, includes trend signals):\n\n"
         f"{gbp_report}"
@@ -1052,6 +1113,8 @@ def build_poster_crew(
             "and recommended post topics — use them directly. Do not search for additional trend data.\n\n"
             f"{DAY_TOPIC_BINDING_RULE}\n"
             f"Build a {days}-day GBP posting schedule starting from {start_date or 'the next business day'}. "
+            "Use the EXACT POSTING DATES above for every DATE field when they are provided — "
+            "do not compute or shift them. "
             "For TREND_TIE, quote the specific trend signal from the GBP REPORT that drove each post's topic choice. "
             "CRITICAL: Only assign photos from the AVAILABLE PHOTOS list — never repeat a photo "
             "already in the manifest with status used/archived/posted. "

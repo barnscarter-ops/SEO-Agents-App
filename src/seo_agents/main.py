@@ -56,6 +56,7 @@ from seo_agents.run_context import (
     build_run_context,
     release_run_context,
 )
+from seo_agents.week_spec import load_or_create_week_spec
 from seo_agents.status import (
     build_workflow_status,
     format_status_text,
@@ -135,8 +136,16 @@ def _send_failure_alert(phase: str, error: str, topic: str, at: str) -> None:
     delivered = _send_hermes_alert(f"{subject}\n{body}")
 
     app_password = os.getenv("SMTP_APP_PASSWORD", "").strip()
-    from_addr = os.getenv("SMTP_FROM_EMAIL", "barnscarter@gmail.com").strip()
-    to_addr = os.getenv("SMTP_TO_EMAIL", "barnscarter@gmail.com").strip()
+    from_addr = (
+        os.getenv("SMTP_FROM_EMAIL", "").strip()
+        or os.getenv("SMTP_FROM", "").strip()
+        or "barnscarter@gmail.com"
+    )
+    to_addr = (
+        os.getenv("SMTP_TO_EMAIL", "").strip()
+        or os.getenv("SMTP_TO", "").strip()
+        or "barnscarter@gmail.com"
+    )
     if app_password:
         msg = MIMEText(body)
         msg["Subject"] = subject
@@ -374,7 +383,9 @@ def compact_baselines(dry_run: bool = False) -> dict:
     """
     from seo_agents.crew import BASELINE_DIR, read_text
 
-    source_files = sorted(BASELINE_DIR.glob("*.md"))
+    # The owner-reviewed facts file is never compacted: an LLM summary once
+    # replaced real knowledge with a stub claiming WordPress/CF7 (2026-08-28).
+    source_files = sorted(p for p in BASELINE_DIR.glob("*.md") if "business-facts" not in p.name)
     if not source_files:
         return {"status": "nothing_to_compact", "files": []}
 
@@ -464,41 +475,165 @@ def _fetch_completed_tasks() -> str:
             tasks = json.loads(resp.read())
         if not tasks:
             return ""
-        lines = ["COMPLETED TASKS FROM PREVIOUS RUNS (verify each is still live before recommending it again):"]
+        # A short brief, not a scrape list. Until 2026-09-04 every completed task
+        # was a mandatory live scrape for the website agent; at 24 tasks that
+        # blew CrewAI's 25-iteration cap and the forced final answer was
+        # narration with no report markers, failing the finalize gate.
+        by_week: dict[str, list[str]] = {}
         for t in tasks:
             completed = t.get("updated_at", "")[:10] if t.get("updated_at") else "unknown date"
-            task_id = (t.get("details") or {}).get("task_id", "?") if isinstance(t.get("details"), dict) else "?"
-            lines.append(f"  - [{task_id}] {t.get('title', '?')} — completed {completed}")
-        lines.append("\nFor each item above: scrape the relevant page and confirm the work is still in place.")
-        lines.append("Mark CONFIRMED LIVE or REGRESSION before writing any new recommendations.")
-        return "\n".join(lines)
+            desc = " ".join((t.get("description") or "").split())
+            if len(desc) > 140:
+                desc = desc[:137].rstrip() + "..."
+            entry = f"- {t.get('title', '?')}" + (f" — {desc}" if desc else "")
+            by_week.setdefault(completed, []).append(entry)
+        lines = [
+            "WORK ALREADY DONE ON THE WEBSITE (completed tasks from previous runs):",
+            "",
+            "Purpose: (1) do NOT recommend any of this again unless you observe it missing "
+            "or broken on a page you scrape for the current focus; (2) treat the dates as "
+            "the timeline for judging whether recent changes helped, hurt, or did nothing.",
+            "Do not scrape pages just to re-verify this list — spot-check at most 3 items "
+            "whose pages you are already visiting for the current focus.",
+            "",
+        ]
+        for week, entries in by_week.items():  # already newest-first from the query
+            lines.append(f"### Completed {week}")
+            lines.extend(entries)
+            lines.append("")
+        brief = "\n".join(lines).rstrip() + "\n"
+        try:
+            brief_path = OUTPUT_DIR / "completed-work-brief.md"
+            brief_path.parent.mkdir(parents=True, exist_ok=True)
+            brief_path.write_text(brief, encoding="utf-8")
+        except OSError as exc:
+            print(f"⚠ Could not write completed-work brief: {exc}")
+        return brief
     except Exception as exc:
         print(f"⚠ Could not fetch completed tasks from Supabase: {exc}")
         return ""
 
 
 def _run_supabase_sync(week_of: str = "") -> None:
-    """Push the current outputs to Supabase after a pipeline phase completes."""
+    """Push the current outputs to Supabase after a pipeline phase completes.
+
+    ``week_of`` is required (the Monday key). Clock fallback in supabase-sync
+    was how weeks got filed under the wrong unique key.
+    """
     import subprocess
+
+    if not week_of:
+        print("❌ supabase-sync refused: week_of is required (pass the Monday WeekSpec)")
+        sys.exit(1)
 
     script = Path(__file__).parent.parent.parent / "scripts" / "supabase-sync.mjs"
     if not script.exists():
-        print("⚠ supabase-sync.mjs not found — skipping Supabase sync")
-        return
-    cmd = ["node", str(script)]
-    if week_of:
-        cmd += ["--week-of", week_of]
+        print("❌ supabase-sync.mjs not found")
+        sys.exit(1)
+    cmd = ["node", str(script), "--week-of", week_of]
     print("\n🔄 Syncing to Supabase...")
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=str(script.parent.parent))
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=90, cwd=str(script.parent.parent)
+        )
         if proc.stdout:
             print(proc.stdout.strip())
         if proc.returncode != 0:
-            print(f"⚠ Supabase sync failed (exit {proc.returncode}): {proc.stderr.strip()}")
-        else:
-            print("✅ Supabase sync complete")
+            print(f"❌ Supabase sync failed (exit {proc.returncode}): {proc.stderr.strip()}")
+            sys.exit(proc.returncode or 1)
+        print("✅ Supabase sync complete")
+    except subprocess.TimeoutExpired:
+        print("❌ Supabase sync timed out after 90s")
+        sys.exit(1)
     except Exception as exc:
-        print(f"⚠ Supabase sync error: {exc}")
+        print(f"❌ Supabase sync error: {exc}")
+        sys.exit(1)
+
+
+def _count_day_headers(path: Path) -> int:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    return sum(1 for line in text.splitlines() if line.lstrip().startswith(("DAY:", "**DAY:")))
+
+
+def executor_skip_reason() -> str | None:
+    """Why the executor crew should not run this week, or None to run it.
+
+    Pure decision, no model calls. Legacy runs without a task graph keep the
+    old behaviour (None). A task graph with nothing executable means every
+    queued task is blocked or waiting on the owner; those tasks still reach
+    Supabase from grizzly_execution_queue.md, so nothing is lost by skipping.
+    """
+    from seo_agents.crew import _filter_executable_tasks, task_graph_tasks
+
+    tasks = task_graph_tasks()
+    if tasks is None:
+        return None
+    if not tasks:
+        return "task graph is empty (no tasks were queued this week)"
+    if _filter_executable_tasks():
+        return None
+    blocked = ", ".join(
+        f"{t.get('task_id') or t.get('action_id') or '?'} [{t.get('status') or '?'}]" for t in tasks
+    )
+    return f"0 of {len(tasks)} queued tasks are executable; all blocked or waiting on the owner: {blocked}"
+
+
+def write_executor_skip_outputs(reason: str) -> None:
+    """Overwrite the executor's output files with explicit skipped content.
+
+    outputs/ is shared across weeks, so without this last week's completion
+    reports would be read by status.py, actions.py, and supabase-sync.mjs as
+    if they were this week's. The files deliberately contain no '### Task',
+    '## Incomplete', or COMPLETION REPORT blocks, so the downstream parsers
+    extract zero tasks from them.
+    """
+    stamp = _now_iso()
+    summary = "Total Tasks Checked: 0\nVerified: 0\nPartial: 0\nIncomplete: 0\n"
+    (OUTPUT_DIR / "final_report.md").write_text(
+        "# Final Verified Report\n\n"
+        f"Executor crew skipped at {stamp}.\n\n"
+        f"Reason: {reason}\n\n"
+        "No executor agent ran, so this phase produced no completions, deliverables, or "
+        "owner sign-off items. Owner-gated tasks remain in grizzly_execution_queue.md and "
+        "are synced to Supabase as waiting_on_owner from there.\n\n"
+        "## Verification Summary\n\n" + summary,
+        encoding="utf-8",
+    )
+    (OUTPUT_DIR / "delegation_verification.md").write_text(
+        "# Delegation Verification\n\n"
+        f"Executor crew skipped at {stamp}: {reason}\n\n" + summary,
+        encoding="utf-8",
+    )
+    for stem in ("content_completion", "assets_completion", "technical_completion", "website_completion"):
+        (OUTPUT_DIR / f"{stem}.json").write_text(
+            json.dumps({"completions": [], "executor_skipped": True, "reason": reason, "at": stamp}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        md = OUTPUT_DIR / f"{stem}.md"
+        if md.exists():
+            # actions._load_completions falls back to the markdown when the JSON
+            # has no completions; a stale markdown report must not win.
+            md.write_text(f"Executor crew skipped at {stamp}: {reason}\n", encoding="utf-8")
+
+
+def _require_fresh_schedule(path: Path, min_days: int, label: str, since: float) -> None:
+    """`since` is the wall-clock time (time.time()) just before this kickoff began."""
+    if not path.exists():
+        print(f"❌ {label} schedule missing: {path}")
+        sys.exit(1)
+    # st_mtime is wall clock; it must be newer than this kickoff, not merely recent,
+    # so a retry cannot accept the previous attempt's file. Allow 5s of clock skew.
+    mtime = path.stat().st_mtime
+    if mtime < since - 5:
+        print(f"❌ {label} schedule was not written by this run ({time.time() - mtime:.0f}s old): {path}")
+        sys.exit(1)
+    n = _count_day_headers(path)
+    if n < min_days:
+        print(f"❌ {label} schedule has {n} DAY: blocks (need ≥ {min_days})")
+        sys.exit(1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -625,15 +760,12 @@ def parse_args() -> argparse.Namespace:
     website.add_argument("--section", default="", help="Target section key in index.html (see knowledge/website-structure.md).")
     website.add_argument("--live", action="store_true", help="Write into the site repo, commit, and push (deploys via Vercel). Default: preview only.")
 
-    # Legacy: allow `seo-agents <topic>` as shorthand for `seo-agents research <topic>`
-    parser.add_argument("topic", nargs="?", help=argparse.SUPPRESS)
-    parser.add_argument("--site-url", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--audience", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--region", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--keywords", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--skip-execute", action="store_true", help=argparse.SUPPRESS)
-
+    # No root-level positional here, on purpose. A hidden root `topic`
+    # (nargs="?") used to live here for the legacy `seo-agents <topic>` form.
+    # argparse matched it with zero strings AFTER the research subparser had
+    # run and overwrote args.topic with None, so every scheduled run from
+    # June to 2026-09-04 researched a blank focus (run_meta.json topic "").
+    # The legacy form never worked with subparsers anyway (invalid choice).
     return parser.parse_args()
 
 
@@ -661,43 +793,62 @@ def _run_execute_pipeline() -> None:
         print("   seo-agents research <topic>")
         sys.exit(1)
 
-    crew = build_executor_crew()
+    week = load_or_create_week_spec(OUTPUT_DIR)
+    start_date = week.gbp_start
+    print(
+        f"📅 WeekSpec run_friday={week.run_friday} week_of={week.week_of} "
+        f"gbp_start={week.gbp_start}"
+    )
+
     t0 = time.monotonic()
-    try:
-        result = crew.kickoff()
-        print(result)
-        final = OUTPUT_DIR / "final_report.md"
-        archived_path = ""
-        if final.exists():
-            stamp = date.today().isoformat()
-            archived_file = ARCHIVE_DIR / f"final_report_{stamp}.md"
-            archived_file.write_bytes(final.read_bytes())
-            archived_path = str(archived_file)
-            print(f"\n✅ Final report archived to: {archived_file}")
+    skip_reason = executor_skip_reason()
+    if skip_reason:
+        # Decide in code, before any model call. On 2026-09-04 the empty
+        # executable set fell back to the raw queue and six agents spent
+        # 1,789 s "executing" four owner-blocked tasks.
+        write_executor_skip_outputs(skip_reason)
+        print(f"\n⏭  Executor crew skipped — {skip_reason}")
         write_run_health("execute", "success", started_at=t0)
         write_workflow_status(
             phase="execute",
             phase_status="complete",
-            extra={"archived_final_report": archived_path},
+            extra={"executor_skipped": True, "skip_reason": skip_reason, "week_of": week.week_of},
         )
-    except Exception as e:
-        write_run_health("execute", "failed", error=str(e), started_at=t0)
-        write_workflow_status(phase="execute", phase_status="failed", error=str(e))
-        print(f"\n❌ Executor crew failed: {e}")
-        sys.exit(1)
-
-    # Day 1 (today, Friday) posts immediately on approval.
-    # Days 2-7 (Saturday through Thursday) are the 6-day scheduled queue via daily cron.
-    start_date = date.today().isoformat()
+    else:
+        crew = build_executor_crew()
+        try:
+            result = crew.kickoff()
+            print(result)
+            final = OUTPUT_DIR / "final_report.md"
+            archived_path = ""
+            if final.exists():
+                stamp = date.today().isoformat()
+                archived_file = ARCHIVE_DIR / f"final_report_{stamp}.md"
+                archived_file.write_bytes(final.read_bytes())
+                archived_path = str(archived_file)
+                print(f"\n✅ Final report archived to: {archived_file}")
+            write_run_health("execute", "success", started_at=t0)
+            write_workflow_status(
+                phase="execute",
+                phase_status="complete",
+                extra={"archived_final_report": archived_path, "week_of": week.week_of},
+            )
+        except Exception as e:
+            write_run_health("execute", "failed", error=str(e), started_at=t0)
+            write_workflow_status(phase="execute", phase_status="failed", error=str(e))
+            print(f"\n❌ Executor crew failed: {e}")
+            sys.exit(1)
 
     print(f"\n{'─'*60}")
-    print(f"📅 Auto-running GBP post schedule (starting {start_date})...")
+    print(f"📅 Auto-running GBP post schedule (starting {start_date}, week_of {week.week_of})...")
     t1 = time.monotonic()
+    kickoff1 = time.time()
     try:
         gbp_crew = build_poster_crew(start_date=start_date, days=7)
         gbp_result = gbp_crew.kickoff()
         print(gbp_result)
         schedule_path = OUTPUT_DIR / "gbp_posting_schedule.md"
+        _require_fresh_schedule(schedule_path, 7, "GBP", kickoff1)
         photo_path = os.getenv("GBP_PHOTO_PATH", r"C:\Workspace\Shared\Assets\Media\Grizzly\GBP Post Photos")
         archived_photos = archive_used_photos(schedule_path, Path(photo_path))
         if archived_photos:
@@ -706,29 +857,37 @@ def _run_execute_pipeline() -> None:
         write_workflow_status(
             phase="post_schedule",
             phase_status="complete",
-            args={"start_date": start_date, "days": 7},
+            args={"start_date": start_date, "days": 7, "week_of": week.week_of},
             extra={"archived_photos": archived_photos},
         )
-        print(f"✅ GBP posting schedule saved")
+        print("✅ GBP posting schedule saved")
+    except SystemExit:
+        raise
     except Exception as e:
         write_run_health("post_schedule", "failed", error=str(e), started_at=t1)
         write_workflow_status(phase="post_schedule", phase_status="failed", error=str(e))
-        print(f"⚠ GBP post schedule failed (non-fatal): {e}")
+        print(f"❌ GBP post schedule failed: {e}")
+        sys.exit(1)
 
     print(f"\n{'─'*60}")
-    print(f"📘 Auto-running Facebook post schedule (starting {start_date})...")
+    print(f"📘 Auto-running Facebook post schedule (starting {start_date}, week_of {week.week_of})...")
     t2 = time.monotonic()
+    kickoff2 = time.time()
     try:
         fb_crew = build_facebook_crew(start_date=start_date, days=7)
         fb_result = fb_crew.kickoff()
         print(fb_result)
+        _require_fresh_schedule(OUTPUT_DIR / "facebook_posting_schedule.md", 4, "Facebook", kickoff2)
         write_run_health("facebook_schedule", "success", started_at=t2)
-        print(f"✅ Facebook posting schedule saved")
+        print("✅ Facebook posting schedule saved")
+    except SystemExit:
+        raise
     except Exception as e:
         write_run_health("facebook_schedule", "failed", error=str(e), started_at=t2)
-        print(f"⚠ Facebook schedule failed (non-fatal): {e}")
+        print(f"❌ Facebook schedule failed: {e}")
+        sys.exit(1)
 
-    _run_supabase_sync()
+    _run_supabase_sync(week_of=week.week_of)
 
 
 def main() -> None:
@@ -737,15 +896,15 @@ def main() -> None:
     args = parse_args()
     ensure_dirs()
 
-    # Determine effective command
     command = args.command
 
-    # Legacy positional: `seo-agents <topic>`
-    if command is None and args.topic:
-        command = "research"
-
-    if command == "research" or (command is None and args.topic):
-        topic = getattr(args, "topic", "") or ""
+    if command == "research":
+        topic = (getattr(args, "topic", "") or "").strip()
+        if not topic:
+            # Fail closed: a blank focus silently produced generic reports for
+            # three months. The wrapper always passes a real topic.
+            print("❌ research requires a non-empty topic")
+            sys.exit(2)
         skip_execute = getattr(args, "skip_execute", False)
         run_args = {
             "topic": topic,
@@ -780,86 +939,79 @@ def main() -> None:
             print(f"❌ Could not acquire run lock: {exc}")
             sys.exit(1)
 
-        # Dry-run decision happens BEFORE any external/mutating step.
-        if args.dry_run:
-            # Compact baselines only if dry-run produces a manifest so Test-Path checks pass.
-            # But no LLM, no Supabase, no adapter calls.
-            manifest = RunManifest(
-                run_id=run_id,
-                topic=topic,
-                provider=provider,
-                model=research_model,
-                research_model=research_model,
-                exec_model=exec_model,
-                started_at=ctx.started_at,
-                site_url=run_args.get("site_url", ""),
-                region=run_args.get("region", ""),
-                audience=run_args.get("audience", ""),
-                keywords=run_args.get("keywords", ""),
-                dry_run=True,
-            )
-            # Build the crew config only (no LLM call).
+        # Everything from here to the kickoff runs under the lock. A crash
+        # before kickoff (missing provider SDK, Supabase down) used to skip the
+        # finally below and strand lock.lock.json, blocking every later run
+        # until someone deleted it by hand (2026-09-04).
+        t0 = time.monotonic()
+        try:
+            # Dry-run decision happens BEFORE any external/mutating step.
+            if args.dry_run:
+                # Compact baselines only if dry-run produces a manifest so Test-Path checks pass.
+                # But no LLM, no Supabase, no adapter calls.
+                manifest = RunManifest(
+                    run_id=run_id,
+                    topic=topic,
+                    provider=provider,
+                    model=research_model,
+                    research_model=research_model,
+                    exec_model=exec_model,
+                    started_at=ctx.started_at,
+                    site_url=run_args.get("site_url", ""),
+                    region=run_args.get("region", ""),
+                    audience=run_args.get("audience", ""),
+                    keywords=run_args.get("keywords", ""),
+                    dry_run=True,
+                )
+                # Build the crew config only (no LLM call).
+                crew = build_seo_crew(
+                    topic=topic,
+                    site_url=run_args["site_url"],
+                    audience=run_args["audience"],
+                    region=run_args["region"],
+                    keywords=run_args["keywords"],
+                    previous_context="",
+                    completed_tasks="",
+                    run_id=run_id,
+                )
+                print(f"Ready: {crew.name}")
+                print(f"Agents ({len(crew.agents)}):")
+                for agent in crew.agents:
+                    print(f"  - {agent.role}")
+                print(f"Tasks: {len(crew.tasks)}")
+                print(f"Run ID: {run_id}")
+                write_run_manifest(manifest)
+                write_evidence_package([], run_id=run_id)
+                write_claim_graph([], run_id=run_id)
+                write_task_graph([], run_id)
+                print(f"✅ Dry-run manifest written to {RUN_MANIFEST_PATH}")
+                print(f"✅ Dry-run evidence_package written to {EVIDENCE_PACKAGE_PATH}")
+                print(f"✅ Dry-run claim_graph written to {CLAIM_GRAPH_PATH}")
+                print(f"✅ Dry-run task_graph written to {OUTPUT_DIR}/task_graph.json")
+                return
+
+            # Live mode — fetch prior context, then research. Do not compact
+            # baselines here: weekly compact archived real knowledge into an
+            # 800-word stub that still claimed WordPress/CF7. Use
+            # `seo-agents compact-baselines` monthly instead.
+            previous_context = load_previous_run_context()
+            print("📋 Fetching completed tasks from Supabase...")
+            completed_tasks = _fetch_completed_tasks()
+            if completed_tasks:
+                print(f"   ✅ {completed_tasks.count(chr(10) + '  -')} completed task(s) loaded for verification")
+            else:
+                print("   ℹ  No completed tasks found — skipping verification step")
+
             crew = build_seo_crew(
                 topic=topic,
                 site_url=run_args["site_url"],
                 audience=run_args["audience"],
                 region=run_args["region"],
                 keywords=run_args["keywords"],
-                previous_context="",
-                completed_tasks="",
+                previous_context=previous_context,
+                completed_tasks=completed_tasks,
                 run_id=run_id,
             )
-            print(f"Ready: {crew.name}")
-            print(f"Agents ({len(crew.agents)}):")
-            for agent in crew.agents:
-                print(f"  - {agent.role}")
-            print(f"Tasks: {len(crew.tasks)}")
-            print(f"Run ID: {run_id}")
-            write_run_manifest(manifest)
-            write_evidence_package([], run_id=run_id)
-            write_claim_graph([], run_id=run_id)
-            write_task_graph([], run_id)
-            print(f"✅ Dry-run manifest written to {RUN_MANIFEST_PATH}")
-            print(f"✅ Dry-run evidence_package written to {EVIDENCE_PACKAGE_PATH}")
-            print(f"✅ Dry-run claim_graph written to {CLAIM_GRAPH_PATH}")
-            print(f"✅ Dry-run task_graph written to {OUTPUT_DIR}/task_graph.json")
-            release_run_context(ctx)
-            return
-
-        # Live mode — proceed with baseline compaction and Supabase fetch.
-        print("\n🗜  Compacting baselines before research...")
-        try:
-            compact_result = compact_baselines()
-        except Exception as _compact_err:
-            print(f"   WARNING: Baseline compaction failed (non-fatal): {_compact_err}")
-            compact_result = {"status": "skipped"}
-        if compact_result["status"] == "compacted":
-            print(f"   ✅ Baselines compacted: {len(compact_result['archived_files'])} files → {compact_result['output']} ({compact_result['reduction_pct']}% smaller)")
-        elif compact_result["status"] == "nothing_to_compact":
-            print("   ℹ  No baseline files to compact — continuing.")
-        else:
-            print(f"   ℹ  Baselines: {compact_result['status']}")
-
-        previous_context = load_previous_run_context()
-        print("📋 Fetching completed tasks from Supabase...")
-        completed_tasks = _fetch_completed_tasks()
-        if completed_tasks:
-            print(f"   ✅ {completed_tasks.count(chr(10) + '  -')} completed task(s) loaded for verification")
-        else:
-            print("   ℹ  No completed tasks found — skipping verification step")
-
-        crew = build_seo_crew(
-            topic=topic,
-            site_url=run_args["site_url"],
-            audience=run_args["audience"],
-            region=run_args["region"],
-            keywords=run_args["keywords"],
-            previous_context=previous_context,
-            completed_tasks=completed_tasks,
-            run_id=run_id,
-        )
-        t0 = time.monotonic()
-        try:
             result = crew.kickoff()
             emit_research_complete(run_id, RESEARCH_OUTPUTS, time.monotonic() - t0)
             print(result)
@@ -908,7 +1060,8 @@ def main() -> None:
                     f"Failures: {len(finalize_result['gate_result']['failures'])}, "
                     f"Warnings: {len(finalize_result['gate_result']['warnings'])}"
                 )
-                write_run_health("finalize", "blocked", topic=topic, error=msg, started_at=t0)
+                # 'failed' (not 'blocked') so the Friday wrapper + watchdog SMS fire.
+                write_run_health("finalize", "failed", topic=topic, error=msg, started_at=t0)
                 write_workflow_status(
                     phase="finalize",
                     phase_status="blocked",
@@ -919,6 +1072,7 @@ def main() -> None:
                 print(f"\n{'─' * 60}")
                 print(f"🚫 {msg}")
                 print(f"{'─' * 60}")
+                sys.exit(1)
             elif skip_execute:
                 print(f"\n{'─' * 60}")
                 print("⏭  --skip-execute: research complete — skipping execution pipeline.")
@@ -986,7 +1140,8 @@ def main() -> None:
                 args={"start_date": start_date, "days": getattr(args, "days", 7)},
                 extra={"archived_photos": archived},
             )
-            _run_supabase_sync(week_of=start_date)
+            from seo_agents.week_spec import compute_week_spec
+            _run_supabase_sync(week_of=compute_week_spec(date.fromisoformat(start_date)).week_of)
         except Exception as e:
             write_run_health("post_schedule", "failed", error=str(e), started_at=t0)
             write_workflow_status(
@@ -1121,7 +1276,8 @@ def main() -> None:
             result = crew.kickoff()
             print(f"\n✅ Facebook schedule written to: outputs/facebook_posting_schedule.md")
             print("  Run `seo-agents actions` to see the new Facebook post actions in the queue.")
-            _run_supabase_sync(week_of=start_date)
+            from seo_agents.week_spec import compute_week_spec
+            _run_supabase_sync(week_of=compute_week_spec(date.fromisoformat(start_date)).week_of)
         except Exception as e:
             print(f"\n❌ Facebook Schedule crew failed: {e}")
             sys.exit(1)

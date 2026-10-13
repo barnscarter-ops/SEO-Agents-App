@@ -58,6 +58,8 @@ export function gbpCrashUnverifiedMessage(exitCode) {
 // because context.close() aborted after a successful submit/verify emit.
 export function gbpDailyStatusForExit(exitCode, parsed = {}) {
   const result = String(parsed.result || '').toLowerCase();
+  const failureReason = String(parsed.failure_reason || '').toLowerCase();
+  const failureDetail = String(parsed.error || '').trim();
   // Listing already has a live match — treat as posted even if we did not compose.
   if (result === 'already_live' || parsed.verified === true) {
     return { status: 'posted', error: null, archive: true, platform_post_id: parsed.postUrl || null };
@@ -67,8 +69,37 @@ export function gbpDailyStatusForExit(exitCode, parsed = {}) {
   if (result === 'already_queued' || result === 'google_scheduled') {
     return { status: 'posted', error: null, archive: false, platform_post_id: parsed.postUrl || null };
   }
+  // Pre-submit failures must never look like a successful post. Missing photo
+  // is a data error; session/captcha need a human — none of these are "posted".
+  if (failureReason === 'session_expired' || isGbpSessionExpiredText(failureDetail)) {
+    return {
+      status: 'error',
+      error: 'GBP session expired — Carter must re-authenticate interactively in the user session with node scripts/gbp-poster/driver.mjs --auth. Do not re-post.',
+      archive: false,
+      platform_post_id: null,
+    };
+  }
+  if (failureReason === 'captcha') {
+    return {
+      status: 'error',
+      error: 'GBP blocked by CAPTCHA/unusual traffic — a human must resolve it in the user session. Do not re-post automatically.',
+      archive: false,
+      platform_post_id: null,
+    };
+  }
+  if (failureReason === 'data') {
+    return {
+      status: 'error',
+      error: failureDetail || 'GBP poster rejected the post data before submission.',
+      archive: false,
+      platform_post_id: null,
+    };
+  }
   if (exitCode === 0 && result !== 'failed' && result !== 'needs_approval' && result !== 'policy_violation' && result !== 'scheduled_native') {
-    return { status: 'posted', error: null, archive: true, platform_post_id: parsed.postUrl || null };
+    // Submitted, not yet confirmed live. archive=false keeps the workbook Posted
+    // gate open so a Grok "not_found" can trigger one retry; the flag flips only
+    // after Grok (or the already_live guard) confirms the post is on the listing.
+    return { status: 'posted', error: null, archive: false, platform_post_id: parsed.postUrl || null };
   }
   if (result === 'posted' || result === 'schedule_unconfirmed') {
     return { status: 'needs_verification', error: gbpNeedsVerificationMessage(parsed), archive: false, platform_post_id: parsed.postUrl || null };
@@ -92,6 +123,26 @@ export function gbpDailyStatusForExit(exitCode, parsed = {}) {
 // we may have already clicked Post.
 export function gbpScheduleStatusForExit(exitCode, parsed = {}) {
   const result = String(parsed.result || '').toLowerCase();
+  const failureReason = String(parsed.failure_reason || '').toLowerCase();
+  const failureDetail = String(parsed.error || '').trim();
+  // A known failure before the Post click is not a candidate for the legacy
+  // daily fallback. Mark it visibly so the existing worker fault alert has a
+  // precise, human-actionable recovery rather than a false scheduled state.
+  if (failureReason === 'session_expired' || isGbpSessionExpiredText(failureDetail)) {
+    return {
+      status: 'error',
+      error: 'GBP session expired — Carter must re-authenticate interactively in the user session with node scripts/gbp-poster/driver.mjs --auth. Do not re-post.',
+    };
+  }
+  if (failureReason === 'captcha') {
+    return {
+      status: 'error',
+      error: 'GBP blocked by CAPTCHA/unusual traffic — a human must resolve it in the user session. Do not re-post automatically.',
+    };
+  }
+  if (failureReason === 'data') {
+    return { status: 'error', error: failureDetail || 'GBP poster rejected the post data before submission.' };
+  }
   if (exitCode === 0 || result === 'scheduled_native') {
     return { status: 'scheduled_native', error: null };
   }
@@ -148,13 +199,14 @@ export function gbpVerifyDisposition({ ok, exitCode, stdout, currentStatus, plat
 export function centralDateHour(nowUtc) {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: 'America/Chicago', hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit',
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
   }).formatToParts(nowUtc);
   const get = (t) => parts.find((p) => p.type === t)?.value;
   const todayDate = `${get('year')}-${get('month')}-${get('day')}`;
   let cstHour = parseInt(get('hour'), 10);
   if (cstHour === 24) cstHour = 0; // some ICU builds emit 24 at midnight
-  return { todayDate, cstHour };
+  const cstMinute = parseInt(get('minute'), 10);
+  return { todayDate, cstHour, cstMinute };
 }
 
 // Retry wrapper for Excel file operations. Excel workbooks can be transiently
@@ -228,7 +280,7 @@ export async function markGbpPostedAndArchive({ postDate, exitCode, runId, env, 
 }
 
 // Apply a driver result to one weekly_posts row (shared by run + daily paths).
-async function applyDriverResult({ supabase, post, result, env, log }) {
+export async function applyDriverResult({ supabase, post, result, env, log }) {
   const parsed = parseDriverJson(result.stdout);
   const map = gbpDailyStatusForExit(result.exitCode, parsed);
   const update = { status: map.status, error: map.error };
@@ -237,7 +289,7 @@ async function applyDriverResult({ supabase, post, result, env, log }) {
     update.platform_post_id = map.platform_post_id;
   }
   if (map.status === 'error') {
-    update.error = (result.stderr || result.error || 'GBP poster failed').slice(0, 300);
+    update.error = (map.error || result.stderr || result.error || 'GBP poster failed').slice(0, 300);
   }
   await supabase.from('weekly_posts').update(update).eq('id', post.id);
   if (map.archive) {

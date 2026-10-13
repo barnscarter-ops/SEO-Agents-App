@@ -31,7 +31,7 @@ assert.ok(m.includes('C:/x.json'));
 
 // gbpDailyStatusForExit: exit code => weekly_posts update intent
 assert.deepEqual(gbpDailyStatusForExit(0, { postUrl: 'u' }),
-  { status: 'posted', error: null, archive: true, platform_post_id: 'u' });
+  { status: 'posted', error: null, archive: false, platform_post_id: 'u' });
 assert.equal(gbpDailyStatusForExit(3, { verificationAttempts: 5 }).status, 'needs_verification');
 assert.equal(gbpDailyStatusForExit(3, {}).archive, false);
 assert.deepEqual(gbpDailyStatusForExit(4, {}), { status: 'pending_approval', error: null, archive: false, platform_post_id: null });
@@ -77,11 +77,32 @@ assert.deepEqual(gbpDailyStatusForExit(0, { result: 'already_live', postUrl: 'ht
   { status: 'posted', error: null, archive: true, platform_post_id: 'https://x/post' });
 assert.deepEqual(gbpDailyStatusForExit(0, { result: 'already_queued' }),
   { status: 'posted', error: null, archive: false, platform_post_id: null });
+assert.equal(
+  gbpDailyStatusForExit(1, { result: 'failed', failure_reason: 'data', error: 'Post image not found: x.jpg' }).status,
+  'error',
+  'missing photo is an error, not posted',
+);
+assert.equal(
+  gbpDailyStatusForExit(1, { result: 'failed', failure_reason: 'data', error: 'Post image not found: x.jpg' }).archive,
+  false,
+);
+assert.ok(
+  gbpDailyStatusForExit(1, { result: 'failed', failure_reason: 'data', error: 'Post image not found: x.jpg' }).error.includes('Post image not found'),
+);
+assert.equal(
+  gbpDailyStatusForExit(1, { result: 'failed', failure_reason: 'session_expired', error: 'logged out' }).status,
+  'error',
+);
+assert.equal(
+  gbpDailyStatusForExit(1, { result: 'failed', failure_reason: 'captcha', error: 'unusual traffic' }).status,
+  'error',
+);
 
 // centralDateHour: 2026-06-27 14:30 UTC is 09:30 CDT (UTC-5 in June)
-const { todayDate, cstHour } = centralDateHour(new Date('2026-06-27T14:30:00Z'));
+const { todayDate, cstHour, cstMinute } = centralDateHour(new Date('2026-06-27T14:30:00Z'));
 assert.equal(todayDate, '2026-06-27');
 assert.equal(cstHour, 9);
+assert.equal(cstMinute, 30);
 // 05:30 UTC same day is 00:30 CDT => still 2026-06-27, hour 0
 const early = centralDateHour(new Date('2026-06-27T05:30:00Z'));
 assert.equal(early.todayDate, '2026-06-27');
@@ -92,6 +113,30 @@ console.log('ok gbp-runner pure helpers');
 // gbpScheduleStatusForExit: exit code => scheduled-post update intent
 assert.deepEqual(gbpScheduleStatusForExit(0, {}),
   { status: 'scheduled_native', error: null });
+assert.deepEqual(
+  gbpScheduleStatusForExit(1, {
+    result: 'failed',
+    failure_reason: 'session_expired',
+    error: 'GBP session expired (logged-out Business Profile marketing page shown).',
+  }),
+  {
+    status: 'error',
+    error: 'GBP session expired — Carter must re-authenticate interactively in the user session with node scripts/gbp-poster/driver.mjs --auth. Do not re-post.',
+  },
+  'session expiry must alert instead of falling back to scheduled',
+);
+assert.deepEqual(
+  gbpScheduleStatusForExit(1, {
+    result: 'failed',
+    failure_reason: 'captcha',
+    error: 'CAPTCHA / unusual traffic interstitial from Google',
+  }),
+  {
+    status: 'error',
+    error: 'GBP blocked by CAPTCHA/unusual traffic — a human must resolve it in the user session. Do not re-post automatically.',
+  },
+  'captcha must alert instead of falling back to scheduled',
+);
 assert.equal(gbpScheduleStatusForExit(3, {}).status, 'scheduled_native');
 assert.ok(gbpScheduleStatusForExit(3, {}).error.includes('unconfirmed'));
 assert.deepEqual(gbpScheduleStatusForExit(4, {}),
@@ -286,6 +331,40 @@ console.log('ok gbpScheduleStatusForExit');
 
   assert.equal(runPhaseCalls.length, 1, 'no retry when the workbook restore fails');
   assert.ok(updates.find(u => u.status === 'error'), 'row marked error when restore fails');
+}
+
+// --- runDailyGbp 9am path: missing photo must stay error, never posted ---
+{
+  const updates = [];
+  const makeQb = (rows) => {
+    const qb = {
+      from: () => qb,
+      select: () => qb,
+      in: () => qb,
+      eq: () => qb,
+      order: () => Promise.resolve({ data: rows }),
+      update: (vals) => { updates.push(vals); return { eq: () => Promise.resolve({ data: null, error: null }) }; },
+    };
+    return qb;
+  };
+  const supabase = makeQb([{ id: 'p1', run_id: 'r1', post_date: '2026-09-09', photo_file: '', status: 'scheduled' }]);
+  const runPhase = async () => ({
+    ok: false,
+    exitCode: 1,
+    stdout: '{"result":"failed","failure_reason":"data","error":"Post image not found: old.jpg"}',
+    stderr: 'Post image not found: old.jpg',
+  });
+
+  await runDailyGbp({
+    supabase, runPhase, log: async () => {}, env: {},
+    todayDate: '2026-09-09', gbpPosterPath: 'C:/fake/driver.mjs', projectRoot: process.cwd(),
+  });
+
+  const posted = updates.find(u => u.status === 'posted');
+  assert.equal(posted, undefined, 'missing photo must not be treated as posted');
+  const errored = updates.find(u => u.status === 'error');
+  assert.ok(errored, 'missing photo marks the row error');
+  assert.ok(String(errored.error || '').includes('Post image not found'));
 }
 
 console.log('ok gbp-runner orchestration');

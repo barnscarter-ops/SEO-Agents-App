@@ -6,20 +6,42 @@ import os from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
 import assert from 'node:assert/strict';
 import { checkPostPolicy, formatViolations } from './policy-check.mjs';
-import { defaultGbpPhotoDirs, resolveGbpImagePath } from '../lib/gbp-paths.mjs';
+import { defaultGbpPhotoDirs, resolveConfiguredCuratedFolder, resolveGbpImagePath } from '../lib/gbp-paths.mjs';
 import { captionSnippet, findSnippetInAllPosts, gbpShouldSubmitLivePost } from '../lib/gbp-listing.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 
 const DEFAULT_CONFIG = 'C:\\Workspace\\Active\\SEO-Agents-App\\config\\gbp-poster.config.json';
+const DEFAULT_WORKBOOK_FALLBACK = 'C:\\Workspace\\Active\\SEO-Agents-App\\outputs\\gbp_posting_schedule.xlsx';
 const USER_DATA_DIR = path.join(os.homedir(), '.claude', 'gbp-session');
 const VIEWPORT = { width: 1365, height: 900 };
 const DEBUG_DIR = 'C:\\Workspace\\Active\\SEO-Agents-App\\outputs\\gbp-debug';
-const VERIFY_DELAY_MS = 60_000;
-const VERIFY_ATTEMPTS = 5;
 // Pre-submit compose steps may be retried (nothing has been posted yet). Once the
 // Post button is clicked we NEVER retry — a re-send would create a duplicate post.
 const POST_ATTEMPTS = 2;
+
+// A local file selection is not enough proof that GBP accepted an attachment.
+// Keep this scoped to the composer, then require a visible media preview before
+// permitting the irreversible Post click.
+const UPLOAD_PREVIEW_SELECTOR = [
+    'img[src^="blob:"]',
+    'img[src^="data:"]',
+    'img[src*="googleusercontent.com"]',
+    '[aria-label*="image preview" i] img',
+    // Since ~2026-09-07 the merged Search UI renders the attached photo without any
+    // <img>/inline-style element the selectors above can see (frame inventory in
+    // outputs/gbp-debug/failure-2026-09-11T14-36-36-816Z.json), but it does show
+    // per-photo "Crop photo" / "Delete photo" controls and an "Edit photos" button
+    // only once an attachment is in the composer. Those are the proof now.
+    '[aria-label="Crop photo" i]',
+    '[aria-label="Delete photo" i]',
+    'button:has-text("Crop photo")',
+    '[role="button"]:has-text("Crop photo")',
+    'button:has-text("Delete photo")',
+    '[role="button"]:has-text("Delete photo")',
+    'button:has-text("Edit photos")',
+    '[role="button"]:has-text("Edit photos")',
+].join(', ');
 
 // ponytail: schedule time is fixed at 9:00 AM business-local; make it a config
 // field if a second time is ever needed.
@@ -32,7 +54,7 @@ function classifyFailure(message) {
     const m = String(message || '').toLowerCase();
     if (/sign in|signed out|logged out|session expired|accounts\.google\.com/.test(m)) return 'session_expired';
     if (/captcha|unusual traffic|not a robot|verify it'?s you|\/sorry\//.test(m)) return 'captcha';
-    if (/image not found|no post found|no caption|workbook not found|not approved/.test(m)) return 'data';
+    if (/image not found|image is required|no post found|no caption|workbook not found|not approved/.test(m)) return 'data';
     if (/could not find|waiting for|timeout|timed out|exceeded|did not register/.test(m)) return 'ui_changed_or_timeout';
     return 'unknown';
 }
@@ -82,6 +104,27 @@ function parseArgs(argv) {
 
 function readJson(filePath) {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+}
+
+export function resolveWorkbookPath(config, { existsSync = fs.existsSync } = {}) {
+    const joined = config?.config_dir && config?.workbook_path
+        ? path.join(config.config_dir, config.workbook_path)
+        : '';
+    const candidates = [joined, config?.workbook_path, DEFAULT_WORKBOOK_FALLBACK].filter(Boolean);
+    for (const candidate of candidates) {
+        if (existsSync(candidate)) return candidate;
+    }
+    throw new Error(`Workbook not found: ${joined || config?.workbook_path || '(missing workbook_path)'}`);
+}
+
+export function requireExistingImage(imagePath, date) {
+    if (!imagePath) {
+        throw new Error(`Post image is required for ${date}; refusing to publish a text-only GBP post.`);
+    }
+    if (!fs.existsSync(imagePath)) {
+        throw new Error(`Post image not found: ${imagePath}`);
+    }
+    return imagePath;
 }
 
 function excelDateToIso(value) {
@@ -245,10 +288,19 @@ async function attachImage(ctx, imagePath, page) {
         const chooser = await chooserPromise;
         await chooser.setFiles(imagePath);
     }
-    // Wait for upload thumbnail
-    await ctx.locator('img[src^="blob:"], img[src^="data:"]').first()
-        .waitFor({ timeout: 30000 })
-        .catch(() => {});
+    // A missing preview used to be ignored, allowing a text-only GBP post to
+    // submit successfully. The preview is the last reversible proof that the
+    // attachment reached the composer, so fail before the Post click instead.
+    try {
+        // ">> visible=true" before .first(): the composer keeps hidden matches
+        // (an avatar <img>, an off-screen "Edit photos" control) earlier in DOM
+        // order, and .first() on the raw union waited on one of those forever.
+        await ctx.locator(`${UPLOAD_PREVIEW_SELECTOR} >> visible=true`).first()
+            .waitFor({ state: 'visible', timeout: 30000 });
+    } catch (error) {
+        throw new Error(`Image upload preview did not appear before timeout; refusing to post without photo. ${error.message || error}`);
+    }
+    logStep('image upload verified', { image: path.basename(imagePath) });
     await page.waitForTimeout(1500);
 }
 
@@ -351,59 +403,6 @@ function resolveCtaUrl(payload, config) {
     return config?.default_cta_url || null;
 }
 
-async function saveVerificationSnapshot(page, caption, visible, attempt) {
-    fs.mkdirSync(DEBUG_DIR, { recursive: true });
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const screenshot = path.join(DEBUG_DIR, `verify-attempt-${attempt}-${stamp}.png`);
-    const textFile = path.join(DEBUG_DIR, `verify-attempt-${attempt}-${stamp}.json`);
-    await page.screenshot({ path: screenshot, fullPage: true }).catch(() => {});
-    const texts = await page.locator('a,button,div[role="button"],span,h1,h2,h3,textarea,[contenteditable="true"],input')
-        .evaluateAll(nodes => [...new Set(nodes.map(n => (
-            n.innerText || n.textContent || n.getAttribute('aria-label') || n.getAttribute('placeholder') || ''
-        ).trim()).filter(Boolean).slice(0, 300))])
-        .catch(() => []);
-    fs.writeFileSync(textFile, JSON.stringify({
-        url: page.url(),
-        caption_snippet: captionSnippet(caption),
-        verified_visible: visible,
-        verification_attempt: attempt,
-        verification_attempts: VERIFY_ATTEMPTS,
-        texts,
-    }, null, 2));
-    return { screenshot, textFile };
-}
-
-async function checkPostVisible(page, snippet) {
-    await page.goto('https://business.google.com/', { waitUntil: 'domcontentloaded' });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    await detectBlockingInterstitial(page);
-    await assertLoggedIn(page);
-    const found = await findSnippetInAllPosts(page, snippet);
-    return found.match === 'live';
-}
-
-async function verifyPosted(page, caption) {
-    const snippet = captionSnippet(caption);
-    let verificationSnapshot = null;
-
-    for (let attempt = 1; attempt <= VERIFY_ATTEMPTS; attempt += 1) {
-        // Give GBP another minute to index/moderate the submitted post before reloading.
-        await page.waitForTimeout(VERIFY_DELAY_MS);
-        const visible = await checkPostVisible(page, snippet);
-        verificationSnapshot = await saveVerificationSnapshot(page, caption, visible, attempt);
-
-        if (visible) {
-            const postUrl = await page.evaluate(() => {
-                const anchor = [...document.querySelectorAll('a[href*="localPost"], a[href*="/posts/"]')][0];
-                return anchor ? anchor.href : null;
-            }).catch(() => null);
-            return { verified: true, postUrl, verificationSnapshot, verificationAttempts: attempt };
-        }
-    }
-
-    return { verified: false, postUrl: null, verificationSnapshot, verificationAttempts: VERIFY_ATTEMPTS };
-}
-
 async function saveFailureArtifacts(page) {
     fs.mkdirSync(DEBUG_DIR, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -415,7 +414,38 @@ async function saveFailureArtifacts(page) {
             n.innerText || n.textContent || n.getAttribute('aria-label') || n.getAttribute('placeholder') || ''
         ).trim()).filter(Boolean).slice(0, 300))])
         .catch(() => []);
-    fs.writeFileSync(textFile, JSON.stringify({ url: page.url(), texts }, null, 2));
+    // 2026-09-11: inventory the composer's media elements so a preview-selector miss
+    // (UPLOAD_PREVIEW_SELECTOR) is diagnosable from the artifact alone, without a
+    // second browser session against the live account.
+    // Inventory media in EVERY frame: the merged Search UI hosts the composer in an
+    // iframe (promote/updates/add), so a top-document scan never sees the preview.
+    const inventory = async (frame) => frame.evaluate(() => {
+        const scope = document.querySelector('div[role="dialog"]') || document.body;
+        const out = [];
+        for (const el of scope.querySelectorAll('img, canvas, video, iframe, [style*="url("]')) {
+            const r = el.getBoundingClientRect();
+            const style = el.getAttribute('style') || '';
+            out.push({
+                tag: el.tagName.toLowerCase(),
+                src: (el.getAttribute('src') || '').slice(0, 100) || undefined,
+                bg: style.includes('url(') ? style.slice(0, 140) : undefined,
+                alt: el.getAttribute('alt') || undefined,
+                aria: el.getAttribute('aria-label') || undefined,
+                role: el.getAttribute('role') || undefined,
+                cls: (el.className && String(el.className).slice(0, 80)) || undefined,
+                w: Math.round(r.width), h: Math.round(r.height),
+            });
+        }
+        const controls = [...scope.querySelectorAll('button, [role="button"]')]
+            .map((b) => (b.getAttribute('aria-label') || b.textContent || '').trim().slice(0, 60))
+            .filter(Boolean);
+        return { dialogs: document.querySelectorAll('div[role="dialog"]').length, scoped_to_dialog: scope !== document.body, items: out.slice(0, 80), controls: controls.slice(0, 60) };
+    }).catch((e) => ({ error: String(e.message || e) }));
+    const media = [];
+    for (const frame of page.frames()) {
+        media.push({ frame: frame.url().slice(0, 120), name: frame.name() || undefined, ...(await inventory(frame)) });
+    }
+    fs.writeFileSync(textFile, JSON.stringify({ url: page.url(), texts, media }, null, 2));
     return { screenshot, textFile };
 }
 
@@ -435,9 +465,10 @@ async function composeAndSubmit(page, payload, schedule = false) {
             await openUpdateComposer(page);
             const ctx = await getComposerCtx(page);
             await fillComposerDescription(ctx, payload.caption, page);
-            if (payload.imagePath) {
-                await attachImage(ctx, payload.imagePath, page);
+            if (!payload.imagePath) {
+                throw new Error(`Post image is required for ${payload.date}; refusing to publish a text-only GBP post.`);
             }
+            await attachImage(ctx, payload.imagePath, page);
             if (payload.ctaUrl) {
                 try {
                     await setComposerCta(ctx, page, payload.ctaUrl);
@@ -488,28 +519,25 @@ async function main() {
         return;
     }
 
-    const workbookPath = path.join(config.config_dir, config.workbook_path);
-    if (!workbookPath || !fs.existsSync(workbookPath)) {
-    // Fallback to default config if workbook_path is not set
-    if (!config.workbook_path) {
-        console.warn('Workbook path not set in config, using default: C:\\Workspace\\Active\\SEO-Agents-App\\outputs\\gbp_posting_schedule.xlsx');
-        workbookPath = 'C:\\Workspace\\Active\\SEO-Agents-App\\outputs\\gbp_posting_schedule.xlsx';
-    }
-        throw new Error(`Workbook not found: ${workbookPath || '(missing workbook_path)'}`);
-    }
+    const workbookPath = resolveWorkbookPath(config);
 
     const postData = parseSchedule(workbookPath, args.date);
     const payload = buildPayload(postData);
     payload.ctaUrl = resolveCtaUrl(payload, config);
     if (!payload.caption) throw new Error(`Post ${args.date} has no caption/body text.`);
 
-    // Workbook paths often point at E:\Media\Grizzly\Curated which may not be
-    // mounted. Resolve against the local photo cache before failing.
+    // Workbook paths often point at renamed cache files or the dead E: folder.
+    // Resolve against the local curated pool (service match, then any still)
+    // before refusing to publish.
     {
         const dirs = defaultGbpPhotoDirs(process.env);
+        const curatedPreferred = resolveConfiguredCuratedFolder(config.curated_photo_folder, process.env);
         const resolved = resolveGbpImagePath(payload.imagePath, {
             date: payload.date,
-            curatedPreferred: config.curated_photo_folder || dirs.curatedPreferred,
+            topic: payload.topic,
+            caption: payload.caption,
+            service: payload.topic,
+            curatedPreferred: curatedPreferred || dirs.curatedPreferred,
             localCache: dirs.localCache,
         });
         if (resolved && resolved !== payload.imagePath) {
@@ -518,9 +546,7 @@ async function main() {
         payload.imagePath = resolved;
     }
 
-    if (payload.imagePath && !fs.existsSync(payload.imagePath)) {
-        throw new Error(`Post image not found: ${payload.imagePath}`);
-    }
+    requireExistingImage(payload.imagePath, args.date);
 
     // Content-policy gate — runs in dry-run too so rows can be linted without a
     // browser. 2026-07-31: Google rejected three scheduled posts within minutes
@@ -615,26 +641,11 @@ async function main() {
             return;
         }
         // composeAndSubmit returning means the post WAS submitted (the composer
-        // closed, which GBP treats as acceptance). A verification failure here
-        // must NOT be reported as 'failed' (exit 1) — that masks the successful
-        // submission and causes a later re-run to double-post, because the caller
-        // sees a hard error and retries a post that is already live. Wrap
-        // verification so any throw becomes a 'posted + unverified' (exit 3),
-        // which the caller treats as "check manually, do not auto-retry".
-        let verified = false, postUrl = null, verificationSnapshot = null, verificationAttempts = 0;
-        try {
-            ({ verified, postUrl, verificationSnapshot, verificationAttempts } = await verifyPosted(page, payload.caption));
-        } catch (verifyErr) {
-            console.error(`Post was submitted but verification crashed (${verifyErr.message}). Treat as posted-but-unverified — do NOT retry without checking GBP first.`);
-            verificationSnapshot = await saveFailureArtifacts(page).catch(() => null);
-        }
-        emitResult({ result: 'posted', date: payload.date, verified, postUrl, verificationSnapshot, verificationAttempts });
-        if (verified) {
-            console.log('Post submitted and verified on GBP.');
-        } else {
-            console.error(`Post was submitted (composer closed cleanly) but could not be verified in the Posts list after ${VERIFY_ATTEMPTS} checks. Check GBP manually before retrying — retrying may create a duplicate.`);
-            process.exitCode = 3;
-        }
+        // closed, which GBP treats as acceptance). Verification is external: the
+        // Grok bot checks the public listing and writes state/gbp-grok/<date>.json;
+        // the worker reconciles that verdict against weekly_posts.
+        emitResult({ result: 'posted', date: payload.date, verified: false, postUrl: null });
+        console.log('Post submitted on GBP — awaiting external (Grok) verification.');
     } catch (e) {
         if (e.submitted) {
             // Duplicate guard: the Post click already happened. Never retry.
@@ -676,4 +687,4 @@ if (invokedDirectly) {
     });
 }
 
-export { classifyFailure };
+export { classifyFailure, UPLOAD_PREVIEW_SELECTOR };
